@@ -1,14 +1,14 @@
-import os
 import argparse
+import os
 import warnings
 import logging
 from math import radians, cos, sin, asin, sqrt
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from sklearn import metrics
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, learning_curve
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -126,12 +126,12 @@ def build_dataset(dfs):
     sellers = sellers[['seller_id', 'avg_lat', 'avg_lng']].rename(columns={'avg_lat': 'seller_lat', 'avg_lng': 'seller_lng'})
 
     customers = dfs['customers'].merge(geo_agg, left_on='customer_zip_code_prefix', right_on='zip_code_prefix', how='left')
-    customers = customers[['customer_id','avg_lat','avg_lon','customer_zip_code_prefix','customer_state']].rename(columns={'avg_lat':'customer_lat','avg_lon':'customer_lon'})
+    customers = customers[['customer_id','avg_lat','avg_lng','customer_zip_code_prefix','customer_state']].rename(columns={'avg_lat':'customer_lat','avg_lng':'customer_lng'})
     
     oi = items[['order_id','seller_id']].merge(sellers, on='seller_id', how='left')
     oi = oi.merge(orders[['order_id', 'customer_id']], on='order_id', how='left')
     oi = oi.merge(customers, on='customer_id', how='left') 
-    oi['dist_km'] = oi.apply(lambda r: haversine(r['seller_lon'], r['seller_lat'], r['customer_lon'], r['customer_left']))
+    oi['dist_km'] = oi.apply(lambda r: haversine(r['seller_lng'], r['seller_lat'], r['customer_lng'], r['customer_lat']), axis=1)
     dist_agg = oi.groupby('order_id').agg(avg_seller_customer_km=('dist_km','mean')).reset_index()
     
     payments_order = dfs['order_payments'].groupby('order_id')['payment_value'].sum().reset_index().rename(columns={'payment_value':'order_payment_sum'})
@@ -148,10 +148,10 @@ def build_dataset(dfs):
     df = df.merge(customers[['customer_id','customer_zip_code_prefix']],  on='customer_id', how='left')
     df = df.merge(cust_hist, on='customer_id', how='left')
     
-    df['purchase_hour'] = df['order_puchase_timestamp'].dt.hour
-    df['purchase_dayofweek'] = df['order_puchase_timestamp'].dt.dayofweek
+    df['purchase_hour'] = df['order_purchase_timestamp'].dt.hour
+    df['purchase_dayofweek'] = df['order_purchase_timestamp'].dt.dayofweek
     df['time_to_estimated_days'] = (df['order_estimated_delivery_date'] - df['order_purchase_timestamp']).dt.days
-    df['time_to_approved_hours'] = (df['order_approved_at'] - df['order_puchase_timestamp']).dt.total_seconds()/3600.0
+    df['time_to_approved_hours'] = (df['order_approved_at'] - df['order_purchase_timestamp']).dt.total_seconds()/3600.0
     
     logging.info("Dataset montado. Shape: %s", df.shape)
     return df
@@ -182,12 +182,12 @@ def build_preprocessor(numeric_features, categorical_features):
     categorical_transformer = Pipeline(
         steps=[
           ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse=False))  
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))  
         ]
     )
     
     preprocessor = ColumnTransformer(
-        transformer=[
+        transformers=[
           ('num', numeric_transformer, numeric_features),
             ('cat', categorical_transformer, categorical_features)
         ], remainder='drop'
@@ -214,3 +214,112 @@ def train_and_evaluate(clf, Xtr, Xte, ytr, yte, preprocessor, out_dir, show_roc=
             metrics["roc_auc"] = roc_auc_score(yte, y_proba)
         except:
             pass
+
+    logging.info("Modelo: %s - Metrics: %s", clf.__class__.__name__, metrics)
+
+    cr = classification_report(yte, y_pred)
+    cm = confusion_matrix(yte, y_pred)
+    
+    plt.figure(figsize=(4,3))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title(f'Confusion matrix - {clf.__class__.__name__}')
+    plt.ylabel('True')
+    plt.xlabel('Pred')
+    fig_path = os.path.join(out_dir, f'confusion_{clf.__class__.__name__}.png')
+    plt.tight_layout()
+    plt.savefig(fig_path)
+    plt.close()
+    logging.info("Confusion matrix salva em %s", fig_path)
+    
+    if show_roc and y_proba is not None:
+        fpr, tpr, _ = roc_curve(yte, y_proba)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f'{clf.__class__.__name__} (AUC {metrics.get("roc_auc", np.nan):.3f})')
+        plt.plot([0,1],[0,1],'k--')
+        plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC Curve'); plt.legend()
+        roc_path = os.path.join(out_dir, f'roc_{clf.__class__.__name__}.png')
+        plt.tight_layout()
+        plt.savefig(roc_path)
+        plt.close()
+        logging.info("ROC curve salva em %s", roc_path)
+    
+    return pipe, metrics, cr
+    
+def plot_learning_curve(estimator, X, y, preprocessor, out_path, title='Learning Curve'):
+    plt.figure(figsize=(8,5))
+    train_sizes, train_scores, test_scores = learning_curve(
+        Pipeline([('pre', preprocessor), ('clf', estimator)]),
+        X, y, cv=5, scoring='f1', train_sizes=np.linspace(0.1,1.0,5), n_jobs=-1
+    )
+    train_scores_mean = np.mean(train_scores, axis=1)
+    test_scores_mean = np.mean(test_scores, axis=1)
+    plt.plot(train_sizes, train_scores_mean, 'o-', label='Train score')
+    plt.plot(train_sizes, test_scores_mean, 'o-', label='CV score')
+    plt.xlabel('Training examples'); plt.ylabel('F1 score'); plt.title(title); plt.legend(); plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+    logging.info("Learning curve salva em %s", out_path)    
+
+
+def main(args):
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # zip handling removed: data is expected to be present in args.data_dir
+        
+    if not os.path.isdir(args.data_dir):
+        logging.error("Diretório de dados não existe: %s", args.data_dir)
+        return
+    
+    dfs = read_csvs(args.data_dir)
+    df = build_dataset(dfs)
+    df_model, features, target = prepare_model_df(df)
+    
+    df_model = df_model.dropna(subset=[target]).copy()
+    X = df_model.drop(columns=[target])
+    y = df_model[target].astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, stratify=y, random_state=args.random_state)
+    logging.info("Train shape: %s, Test shape: %s", X_train.shape, X_test.shape)
+
+    numeric_features = [c for c in features if c not in ['payment_type','customer_zip_code_prefix']]
+    categorical_features = ['payment_type','customer_zip_code_prefix']
+    
+    preprocessor = build_preprocessor(numeric_features, categorical_features)
+    preprocessor.fit(X_train)
+    
+    models = [
+        LogisticRegression(class_weight='balanced', solver='liblinear', random_state=args.random_state, max_iter=1000),
+        RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=args.random_state, n_jobs=-1),
+        GradientBoostingClassifier(n_estimators=200, random_state=args.random_state)
+    ]
+    
+    results = {}
+    for clf in models:
+        pipe, metrics, cr = train_and_evaluate(clf, X_train, X_test, y_train, y_test, preprocessor, out_dir, show_roc=True)
+        results[clf.__class__.__name__] = metrics
+        
+        with open(os.path.join(out_dir, f'classif_report_{clf.__class__.__name__}.txt'), 'w') as f:
+            f.write(cr)
+
+    plot_learning_curve(RandomForestClassifier(n_estimators=200, random_state=args.random_state), X_train, y_train, preprocessor, os.path.join(out_dir, 'learning_curve_rf.png'))
+    
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.random_state) 
+    for clf in models:
+        scores = cross_val_score(Pipeline([('pre', preprocessor), ('clf', clf)]), X_train, y_train, cv=skf, scoring='f1', n_jobs=-1)
+        logging.info("%s CV F1 mean/std: %.4f +/- %.4f", clf.__class__.__name__, scores.mean(), scores.std())
+        
+    summary = pd.DataFrame(results).T
+    summary.to_csv(os.path.join(out_dir, 'model_metrics_summary.csv'))
+    logging.info("Resumo de métricas salvo em %s", os.path.join(out_dir, 'model_metrics_summary.csv'))
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Olist supervised pipeline")
+    parser.add_argument('--zip', type=str, default=None, help='Caminho para o olist.zip.')
+    parser.add_argument('--data-dir', type=str, default='olist', help='Diretório com CSVs extraídos.')
+    parser.add_argument('--out-dir', type=str, default='out', help='Diretório de saída para fig/relatórios.')
+    parser.add_argument('--test-size', type=float, default=0.2)
+    parser.add_argument('--random-state', type=int, default=42)
+    args = parser.parse_args()
+    main(args)
